@@ -89,13 +89,15 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
   unsigned scaleA_tmem_addr = (unsigned)__cvta_generic_to_shared(&s_tmem_scaleA_ptr[0]);
   unsigned scaleB_tmem_addr = (unsigned)__cvta_generic_to_shared(&s_tmem_scaleB_ptr[0]);
 
-  asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-               : : "r"(tmem_addr),   "r"(32));
+  if (threadIdx.x < 32) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                 : : "r"(tmem_addr),   "r"(32));
 
-  asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-               : : "r"(scaleA_tmem_addr), "r"(32));
-  asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-               : : "r"(scaleB_tmem_addr), "r"(32));
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                 : : "r"(scaleA_tmem_addr), "r"(32));
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                 : : "r"(scaleB_tmem_addr), "r"(32));
+  }
   __syncthreads();
 
   for(int k_loop = 0; k_loop < K; k_loop += 64) {
@@ -250,6 +252,21 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
   }
 
   __syncthreads();
+    unsigned int taddr_0, taddr_a, taddr_b;
+
+    if (threadIdx.x < 32) {
+      asm volatile("ld.shared.b32 %0, [%1];":"=&r"(taddr_0):"r"(tmem_addr));
+      asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+          : : "r"(taddr_0), "r"(32));
+      asm volatile("ld.shared.b32 %0, [%1];":"=&r"(taddr_a):"r"(scaleA_tmem_addr));
+      asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+          : : "r"(taddr_a), "r"(32));
+      asm volatile("ld.shared.b32 %0, [%1];":"=&r"(taddr_b):"r"(scaleB_tmem_addr));
+      asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+          : : "r"(taddr_b), "r"(32));
+    }
+  __syncthreads();
+
 }
 
 
@@ -319,10 +336,10 @@ int main() {
 
     uint8_t sca = 117+rand()%20;
     uint8_t scb = 117+rand()%20;
-    for(int i = 0; i < M * 16; i++) ((uint8_t *)host_sfa)[i] = sca;
-    for(int i = 0; i < N * 16; i++) ((uint8_t *)host_sfb)[i] = scb;
-    // for(int i = 0; i < M * 16; i++) ((uint8_t *)host_sfa)[i] = 127;
-    // for(int i = 0; i < N * 16; i++) ((uint8_t *)host_sfb)[i] = 127;
+    // for(int i = 0; i < M * 16; i++) ((uint8_t *)host_sfa)[i] = sca;
+    // for(int i = 0; i < N * 16; i++) ((uint8_t *)host_sfb)[i] = scb;
+    for(int i = 0; i < M * 16; i++) ((uint8_t *)host_sfa)[i] = 127;
+    for(int i = 0; i < N * 16; i++) ((uint8_t *)host_sfb)[i] = 127;
 
     // mat A B rand data
     for (int i = 0; i < M; ++i) {
@@ -341,28 +358,6 @@ int main() {
       }
     }
 
-    for (int i = 0; i < 16; ++i) {
-      for (int k = 0; k < K; k += 2) {
-        ((uint8_t *)host_A)[i * (K/2) + k/2] = ((i%16) << 4) | ((i%16) & 0x0F);
-      }
-    }
-    for (int i = 16; i < 17; ++i) {
-      for (int k = 0; k < K; k += 2) {
-        ((uint8_t *)host_A)[i * (K/2) + k/2] = (((k+1)%16) << 4) | ((k%16) & 0x0F);
-      }
-    }
-    for (int i = 0; i < 16; ++i) {
-      for (int k = 0; k < K; k += 2) {
-        ((uint8_t *)host_B)[i * (K/2) + k/2] = ((i%16) << 4) | ((i%16) & 0x0F);
-      }
-    }
-    for (int i = 16; i < 17; ++i) {
-      for (int k = 0; k < K; k += 2) {
-        ((uint8_t *)host_B)[i * (K/2) + k/2] = (((k+1)%16) << 4) | ((k%16) & 0x0F);
-      }
-    }
-
-    //print
     {
       std::cout <<"shape:"<<M<<" "<<N<<" "<<K<<std::endl;
       std::cout <<"kind::mxf4nvf4"<<std::endl;
@@ -453,6 +448,27 @@ int main() {
       printf("\n");
     }
 
+    // 输出矩阵 C
+    std::vector<float> C(M * N);
+    C.assign(M * N, 0.0f);
+
+    // 执行计算
+    gemm_fp4_to_float<M, N, K>((uint8_t *)host_A, (uint8_t *)host_B, C);
+
+    bool cmp_fail = false;
+    std::cout <<"Mat_C_cpu:"<<std::endl;
+    for(int m = 0; m < M; m++) {
+      printf(" %3d : ",m);
+      for(int n = 0; n < N; n++) {
+        printf("%08.2f ",C[m * N + n]);
+        if (((float *)host_C)[m * N + n] != C[m * N + n]) {
+          cmp_fail = true;
+        }
+      }
+      printf("\n");
+    }
+
+    std::cerr << "Compare " << (cmp_fail ? "fail !" : "success !") << std::endl;
 
     cudaFree(dev_A);
     cudaFree(dev_B);
