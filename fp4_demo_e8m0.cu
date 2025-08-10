@@ -76,6 +76,7 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
     __shared__ uint8_t  mat_b_share[N * K / 2];
     __shared__ uint8_t  sfa_share[M*16];
     __shared__ uint8_t  sfb_share[M*16];
+    if(tid==0){
 
     for (int i = 0; i < M; i++){
       for (int j = 0; j < K / 2; j++){
@@ -112,6 +113,7 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
         }
       }
     }
+    }
 
 
     __syncthreads();
@@ -123,13 +125,16 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
     unsigned scaleA_tmem_addr = (unsigned)__cvta_generic_to_shared(&s_tmem_scaleA_ptr[0]);
     unsigned scaleB_tmem_addr = (unsigned)__cvta_generic_to_shared(&s_tmem_scaleB_ptr[0]);
 
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-                 : : "r"(tmem_addr),   "r"(32));
+    if(tid<32){
 
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-                 : : "r"(scaleA_tmem_addr), "r"(32));
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-                 : : "r"(scaleB_tmem_addr), "r"(32));
+      asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                   : : "r"(tmem_addr),   "r"(32));
+
+      asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                   : : "r"(scaleA_tmem_addr), "r"(32));
+      asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                   : : "r"(scaleB_tmem_addr), "r"(32));
+    }
     __syncthreads();
 
 
@@ -259,20 +264,32 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
       mat_c[32 * tid + i] = ((float*)regD)[i];
     }
 
-    // // if (tid < 32) {
-    //     printf("TMEM: %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f  %d\n",
-    //            ((float*)regD)[0], ((float*)regD)[1], ((float*)regD)[2], ((float*)regD)[3],
-    //            ((float*)regD)[4], ((float*)regD)[5], ((float*)regD)[6], ((float*)regD)[7],
-    //            ((float*)regD)[8], ((float*)regD)[9], ((float*)regD)[10], ((float*)regD)[11],
-    //            ((float*)regD)[12], ((float*)regD)[13], ((float*)regD)[14], ((float*)regD)[15],
-    //            ((float*)regD)[0+16], ((float*)regD)[1+16], ((float*)regD)[2+16], ((float*)regD)[3+16],
-    //            ((float*)regD)[4+16], ((float*)regD)[5+16], ((float*)regD)[6+16], ((float*)regD)[7+16],
-    //            ((float*)regD)[8+16], ((float*)regD)[9+16], ((float*)regD)[10+16], ((float*)regD)[11+16],
-    //            ((float*)regD)[12+16], ((float*)regD)[13+16], ((float*)regD)[14+16], ((float*)regD)[15+16], tid); 
-    // // }
+    // if (tid < 32) {
+        // printf("TMEM: %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f  %d\n",
+        //        ((float*)regD)[0], ((float*)regD)[1], ((float*)regD)[2], ((float*)regD)[3],
+        //        ((float*)regD)[4], ((float*)regD)[5], ((float*)regD)[6], ((float*)regD)[7],
+        //        ((float*)regD)[8], ((float*)regD)[9], ((float*)regD)[10], ((float*)regD)[11],
+        //        ((float*)regD)[12], ((float*)regD)[13], ((float*)regD)[14], ((float*)regD)[15],
+        //        ((float*)regD)[0+16], ((float*)regD)[1+16], ((float*)regD)[2+16], ((float*)regD)[3+16],
+        //        ((float*)regD)[4+16], ((float*)regD)[5+16], ((float*)regD)[6+16], ((float*)regD)[7+16],
+        //        ((float*)regD)[8+16], ((float*)regD)[9+16], ((float*)regD)[10+16], ((float*)regD)[11+16],
+        //        ((float*)regD)[12+16], ((float*)regD)[13+16], ((float*)regD)[14+16], ((float*)regD)[15+16], tid); 
+    // }
 
     
     __syncthreads();
+
+    if(tid<32){
+      asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32  %0, 32;"
+               : : "r"(s_tmem_ptr[0]));
+      asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32  %0, 32;"
+                   : : "r"(s_tmem_scaleA_ptr[0]));
+      asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32  %0, 32;"
+                 : : "r"(s_tmem_scaleB_ptr[0]));
+      
+    }
+
+    
 }
 
 
@@ -335,23 +352,25 @@ int main() {
     cudnnMallocHostInBytes(&host_sfa, M * 16 * sizeof(uint8_t));
     cudnnMallocHostInBytes(&host_sfb, N * 16 * sizeof(uint8_t));
 
-    for(int i = 0; i < M * 16; i++) ((uint8_t *)host_sfa)[i] = 127;
-    for(int i = 0; i < M * 16; i++) ((uint8_t *)host_sfb)[i] = 127;
+    // for(int i = 0; i < M * 16; i++) ((uint8_t *)host_sfa)[i] = 127;
+    // for(int i = 0; i < M * 16; i++) ((uint8_t *)host_sfb)[i] = 127;
 
 
     // scale data
     // scale A[M* blockscale]:([128,1]\[128,2]\[128,4])
     for (int i = 0; i < M; ++i) {
       for (int j = 0; j < BLOCKSCALE_NX; j++) {
-        ((uint8_t *)host_sfa)[i*16 + j] = (uint8_t)(117+rand()%20);
+        // ((uint8_t *)host_sfa)[i*16 + j] = (uint8_t)(117+rand()%20);
         // ((uint8_t *)host_sfa)[i*16 + j] = rand() % 255;
+        ((uint8_t *)host_sfa)[i*16 + j] = (uint8_t)(127);
       }
     }
     //scale B[N* blockscale]:([8,1]\[8,2]\[8,4]\[16,1]\[16,2]\[16,4]......)
     for (int i = 0; i < N; ++i) {
       for (int j = 0; j < BLOCKSCALE_NX; j++) {
-        ((uint8_t *)host_sfb)[i*16 + j] = (uint8_t)(117+rand()%20);
+        // ((uint8_t *)host_sfb)[i*16 + j] = (uint8_t)(117+rand()%20);
         // ((uint8_t *)host_sfb)[i*16 + j] = rand() % 255;
+        ((uint8_t *)host_sfb)[i*16 + j] = (uint8_t)(127);
       }
     }
 
@@ -374,6 +393,7 @@ int main() {
 
     //print
     {
+      std::cout <<"shape:"<<M<<" "<<N<<" "<<K<<std::endl;
       std::cout <<"kind::mxf4nvf4"<<std::endl;
       std::cout <<"Mat_A(K-major:128x64):"<<std::endl;
       for (int i = 0; i < M; ++i) {
@@ -451,14 +471,10 @@ int main() {
                                      (uint8_t *)dev_sfa,
                                      (uint8_t *)dev_sfb,
                                      (float *)dev_C);
-    // auto status = cudaLaunchKernelEx(&config, mma_on_tmem_old,
-    //                                  (uint8_t *)dev_A,
-    //                                  (uint8_t *)dev_B,
-    //                                  (uint8_t *)dev_sfa,
-    //                                  (float *)dev_C);
-    cudaDeviceSynchronize();
 
-    checkCUDAErrors(cudaMemcpy(host_C, dev_C, M * N * sizeof(float), cudaMemcpyHostToDevice));
+    checkCUDAErrors(cudaDeviceSynchronize());
+
+    cudaMemcpy(host_C, dev_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
     std::cout <<"Mat_C:"<<std::endl;
     for(int m = 0; m < M; m++) {
