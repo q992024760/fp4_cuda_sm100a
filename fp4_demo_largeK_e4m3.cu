@@ -13,7 +13,7 @@
 #define M 128
 #define N 32
 #define K 256
-#define BLOCKSCALE_NX 2   //scale_vec::2X //指令内部分手动设置
+#define BLOCKSCALE_NX 4   //scale_vec::4X //指令内部分手动设置
 
 union SmemDescriptor
 {
@@ -205,7 +205,7 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
     desc.sparse_id2_=0;
     desc.a_format_ = 1;
     desc.b_format_ = 1;
-    desc.scale_format_ = 1;
+    desc.scale_format_ = 0;
     desc.a_major_ = 0;
     desc.b_major_ = 0;
     desc.a_negate_ = 0;
@@ -228,7 +228,7 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
             "{\n\t"
             ".reg .pred p;\n\t"
             "setp.ne.b32 p, %4, 0;\n\t"
-            "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::2X [%0], %1, %2, %3, [%5], [%6], p; \n\t"
+            "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X [%0], %1, %2, %3, [%5], [%6], p; \n\t"
             "}\n"
             :
             : "r"(s_tmem_ptr[0]), "l"(uint64_t(mat_a_desc)),
@@ -367,19 +367,21 @@ int main() {
 
     for(int i = 0; i < M * (K/16); i++) ((uint8_t *)host_sfa)[i] = 0;
     for(int i = 0; i < N * (K/16); i++) ((uint8_t *)host_sfb)[i] = 0;
+    uint8_t e4m3_valid_vals[] = {0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77};
+
 
     // scale A[M* blockscale]:([128,1]\[128,2]\[128,4])
     for(int k = 0; k < (K/16); k+=4){ 
       for (int i = 0; i < M; ++i) {
         for (int j = 0; j < BLOCKSCALE_NX; j++) {
-          ((uint8_t *)host_sfa)[i*16 + k + j] = (uint8_t)(117+rand()%20);
+          ((uint8_t *)host_sfa)[i*16 + k + j] = (e4m3_valid_vals[rand()%120]);
           // ((uint8_t *)host_sfa)[i*16 + k + j] = (uint8_t)(127);
         }
       }
       //scale B[N* blockscale]:([8,1]\[8,2]\[8,4]\[16,1]\[16,2]\[16,4]......)
       for (int i = 0; i < N; ++i) {
         for (int j = 0; j < BLOCKSCALE_NX; j++) {
-          ((uint8_t *)host_sfb)[i*16 + k + j] = (uint8_t)(117+rand()%20);
+          ((uint8_t *)host_sfb)[i*16 + k + j] = (e4m3_valid_vals[rand()%120]);
           // ((uint8_t *)host_sfb)[i*16 + k + j] = (uint8_t)(127);
         }
       }
