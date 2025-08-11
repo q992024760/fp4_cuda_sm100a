@@ -1,6 +1,100 @@
 import numpy as np
 import re
 import sys
+import torch
+
+
+def mxfp4_e4m3_matmul(block_size=32, A_quant=None, B_quant=None, A_block_scales=None, B_block_scales=None, calculate_dtype=torch.float64):
+    # 将输入的数组都转为torch格式
+    A_quant = torch.from_numpy(A_quant) if isinstance(A_quant, np.ndarray) else A_quant
+    B_quant = torch.from_numpy(B_quant) if isinstance(B_quant, np.ndarray) else B_quant
+    A_block_scales = torch.from_numpy(A_block_scales) if isinstance(A_block_scales, np.ndarray) else A_block_scales
+    B_block_scales = torch.from_numpy(B_block_scales) if isinstance(B_block_scales, np.ndarray) else B_block_scales
+    # 将scale重新解释为torch的fp8_e4m3类型
+    # 使用view重新解释二进制数据为float8_e4m3fn
+    A_block_scales = A_block_scales.view(torch.float8_e4m3fn)
+    B_block_scales = B_block_scales.view(torch.float8_e4m3fn)
+    # import pdb; pdb.set_trace()
+
+    m, k = A_quant.shape
+    n, k2 = B_quant.shape
+    assert k == k2, "The number of columns of A and B must be equal"
+    # 保证block size兼容
+    padded_k = (k + block_size - 1) // block_size * block_size
+    n_blocks = padded_k // block_size
+
+    # 初始化结果矩阵
+    C = torch.zeros((m, n), dtype=torch.float32)
+
+    # 执行矩阵乘法
+    for i in range(m):
+        for j in range(n):
+            total = torch.tensor(0.0, dtype=calculate_dtype)
+
+            # 处理每个block
+            for block_idx in range(n_blocks):
+                start = block_idx * block_size
+                end = min((block_idx + 1) * block_size, k)
+                actual_block_size = end - start
+
+                if actual_block_size == 0:
+                    continue
+
+                # 取A和B的block
+                A_block = A_quant[i, start:end].to(calculate_dtype)
+                B_block = B_quant[j, start:end].to(calculate_dtype)
+                A_scale = A_block_scales[i, block_idx].to(calculate_dtype)
+                B_scale = B_block_scales[j, block_idx].to(calculate_dtype)
+
+                # 计算点积
+                dot = torch.sum(A_block * B_block * A_scale * B_scale)
+                total += dot
+            C[i, j] = total
+
+    return C.numpy()
+
+def mxfp4_e8m0_matmul(block_size=32, A_quant=None, B_quant=None, A_block_scales=None, B_block_scales=None, calculate_dtype=np.float32):
+    m, k = A_quant.shape
+    n, k2 = B_quant.shape
+    assert k == k2, "The number of columns of A and B must be equal"
+    # Ensure block size compatibility
+    padded_k = (k + block_size - 1) // block_size * block_size
+    n_blocks = padded_k // block_size
+    
+    # Initialize result matrix (始终float32)
+    C = np.zeros((m, n), dtype=np.float32)
+    
+    # Perform matrix multiplication
+    for i in range(m):
+        for j in range(n):
+            total = calculate_dtype(0.0)
+            
+            # Process each block
+            for block_idx in range(n_blocks):
+                start = block_idx * block_size
+                end = min((block_idx + 1) * block_size, k)
+                actual_block_size = end - start
+                
+                if actual_block_size == 0:
+                    continue
+                
+                # Get blocks of A and B
+                A_block = A_quant[i, start:end].astype(calculate_dtype)
+                B_block = B_quant[j, start:end].astype(calculate_dtype)
+                A_scale = calculate_dtype(A_block_scales[i, block_idx])
+                B_scale = calculate_dtype(B_block_scales[j, block_idx])
+                # import pdb; pdb.set_trace()
+                A_scale = (calculate_dtype(2.0) ** (A_scale - 127)).astype(calculate_dtype)
+                B_scale = (calculate_dtype(2.0) ** (B_scale - 127)).astype(calculate_dtype)
+                A_scale = np.nan if A_scale == 0 else A_scale
+                B_scale = np.nan if B_scale == 0 else B_scale
+                
+                # Compute dot product
+                dot = np.sum(A_block * B_block * A_scale * B_scale, dtype=calculate_dtype)
+                total += dot
+            C[i, j] = np.float32(total)
+    
+    return C
 
 def parse_matrix_from_log(log_content, name, rows, cols):
     """
@@ -17,6 +111,8 @@ def parse_matrix_from_log(log_content, name, rows, cols):
     """
     # 定义用于查找矩阵头部的正则表达式
     if name == 'Mat_C':
+        header_pattern = re.compile(r"^\s*" + re.escape(name) + r":")
+    elif name in ['scale_A', 'scale_B']:
         header_pattern = re.compile(r"^\s*" + re.escape(name) + r":")
     else:
         header_pattern = re.compile(r"^\s*" + re.escape(name) + r"\(K-major:\d+x\d+\):")
@@ -71,69 +167,149 @@ def parse_matrix_from_log(log_content, name, rows, cols):
     # 将一维列表重塑为正确的矩阵维度
     return np.array(numbers).reshape((rows, cols))
 
-def extract_mnk_from_log(log_content):
-    """
-    从日志第一行提取形如 'shape:M N K' 的 M, N, K 三个整数
-    """
-    match = re.search(r'shape\s*:\s*(\d+)\s+(\d+)\s+(\d+)', log_content)
-    if not match:
-        raise ValueError("日志中未找到形如 'shape:M N K' 的形状描述")
-    M = int(match.group(1))
-    N = int(match.group(2))
-    K = int(match.group(3))
-    return M, N, K
+def parse_scale_data(data):
+    def parse_hex_to_int8(hex_str):
+        """将十六进制字符串转换为int8整数"""
+        num = int(hex_str, 16)
+        return num
+    
+    # 初始化存储结构
+    scale_A = []
+    scale_B = []
+    current_scale = None
+    
+    # 正则表达式匹配数据行中的所有十六进制值
+    hex_pattern = r'0x[0-9A-Fa-f]{2}'
+    
+    for line in data.split('\n'):
+        line = line.strip()
+        
+        # 检测scale标识
+        if line.startswith('scale A'):
+            current_scale = 'A'
+            continue
+        elif line.startswith('scale B'):
+            current_scale = 'B'
+            continue
+            
+        # 处理数据行 - 匹配所有十六进制值
+        if line and line[0].isdigit() and '[' in line:
+            hex_values = re.findall(hex_pattern, line)
+            if not hex_values:
+                continue
+                
+            # 将十六进制值转换为int8
+            int8_values = [parse_hex_to_int8(hex_val) for hex_val in hex_values]
+            
+            # 根据当前处理的scale添加到相应列表
+            if current_scale == 'A':
+                scale_A.append(int8_values)
+            elif current_scale == 'B':
+                scale_B.append(int8_values)
+
+    if scale_A:
+        n = len(scale_A[0])
+        scale_A = np.array(scale_A).reshape(-1, n)
+    else:
+        scale_A = np.array([])
+
+    if scale_B:
+        n = len(scale_B[0])
+        scale_B = np.array(scale_B).reshape(-1, n)
+    else:
+        scale_B = np.array([])
+    return scale_A.astype(np.uint8), scale_B.astype(np.uint8)
 
 def main():
     """
     主函数，执行整个流程。
     """
-    try:
-        # 读取日志文件
-        with open('test.log', 'r', encoding='utf-8') as f:
-            log_content = f.read()
+    if len(sys.argv) < 2:
+        print("请提供日志文件")
+        sys.exit(1)
+    
+    log_file = sys.argv[1]  # 获取第一个命令行参数
+    
+    # 读取日志文件
+    with open(log_file, 'r', encoding='utf-8') as f:
+        log_content = f.read()
 
-        M, N, K = extract_mnk_from_log(log_content)
+    # 初始化MNK值
+    M, N, K = None, None, None
+    is_e8m0 = None
+    
+    # 读取日志文件
+    with open(log_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            shape_match = re.search(r'shape:(\d+)\s+(\d+)\s+(\d+)', line)
+            if shape_match:
+                # 提取M, N, K值
+                M = int(shape_match.group(1))
+                N = int(shape_match.group(2))
+                K = int(shape_match.group(3))
+                    # 匹配缩放格式 "Scale:e8m0" 或 "Scale:e4m3"
+            scale_match = re.search(r'Scale:\s*(e8m0|e4m3)', line, re.IGNORECASE)
+            if scale_match:
+                scale_format = scale_match.group(1).lower()
+                is_e8m0 = (scale_format == "e8m0")
+                break
+    
+    # 检查是否找到形状信息
+    if M is None:
+        print(f"警告: 在文件 {log_file} 中未找到形状信息")
+    else:
+        print(f"提取的形状参数: M={M}, N={N}, K={K}")
+        # 这里可以添加后续处理代码
 
-        # --- 解析矩阵 ---
-        mat_a = parse_matrix_from_log(log_content, 'Mat_A', M, K)
-        mat_b = parse_matrix_from_log(log_content, 'Mat_B', N, K)
-        mat_c_from_log = parse_matrix_from_log(log_content, 'Mat_C', M, N)
+    # --- 解析矩阵 ---
+    mat_a = parse_matrix_from_log(log_content, 'Mat_A', M, K)
+    mat_b = parse_matrix_from_log(log_content, 'Mat_B', N, K)
+    mat_c_from_log = parse_matrix_from_log(log_content, 'Mat_C', M, N)
+    a_scale, b_scale = parse_scale_data(log_content)
+    # --- 执行矩阵乘法 ---
+    if is_e8m0:
+        print("scale:e8m0")
+        calculated_mat_c = mxfp4_e8m0_matmul(32, mat_a, mat_b, a_scale, b_scale)
+    else:    #e4m3
+        print("scale:e4m3")
+        calculated_mat_c = mxfp4_e4m3_matmul(16, mat_a, mat_b, a_scale, b_scale)
+    # --- 对比结果 ---
+    are_equal = np.allclose(calculated_mat_c, mat_c_from_log, atol=1e-5)
 
-        # --- 执行矩阵乘法 ---
-        calculated_mat_c = np.matmul(mat_a, mat_b.T)
+    # --- 输出结论 ---
+    print("矩阵解析与计算完成。")
+    print("-" * 30)
+    print(f"Mat_A 的维度: {mat_a.shape}")
+    print(f"Mat_B 的维度: {mat_b.shape}")
+    print(f"日志中 Mat_C 的维度: {mat_c_from_log.shape}")
+    print(f"计算出的 Mat_C 维度: {calculated_mat_c.shape}")
+    print("-" * 30)
 
-        # --- 对比结果 ---
-        are_equal = np.allclose(calculated_mat_c, mat_c_from_log, atol=1e-5)
+    print("\n日志中的 Mat_C (前5x5片段):")
+    print(mat_c_from_log[:8, :8])
+    
+    print("\n计算出的 Mat_C (前5x5片段):")
+    print(calculated_mat_c[:8, :8])
+    print("-" * 30)
 
-        # --- 输出结论 ---
-        print("矩阵解析与计算完成。")
-        print("-" * 30)
-        print(f"Mat_A 的维度: {mat_a.shape}")
-        print(f"Mat_B 的维度: {mat_b.shape}")
-        print(f"日志中 Mat_C 的维度: {mat_c_from_log.shape}")
-        print(f"计算出的 Mat_C 维度: {calculated_mat_c.shape}")
-        print("-" * 30)
-
-        print("\n日志中的 Mat_C (前5x5片段):")
-        print(mat_c_from_log[:8, :8])
-        
-        print("\n计算出的 Mat_C (前5x5片段):")
-        print(calculated_mat_c[:8, :8])
-        print("-" * 30)
-
-        if are_equal:
-            print("\n✅ 结论：结果一致。")
-            print("脚本计算出的 Mat_C 与日志文件中记录的 Mat_C 完全相同。")
-        else:
-            print("\n❌ 结论：结果不一致。")
-            print("脚本计算出的 Mat_C 与日志文件中记录的 Mat_C 不同。")
-            difference = np.abs(calculated_mat_c - mat_c_from_log)
-            print(f"最大差值: {np.max(difference)}")
-
-    except FileNotFoundError:
-        print("错误：找不到 'out.log' 文件。请确保该文件与脚本在同一目录下。")
-    except Exception as e:
-        print(f"在执行过程中发生错误: {e}")
+    if are_equal:
+        print("\n✅ 结论：结果一致。")
+        print("脚本计算出的 Mat_C 与日志文件中记录的 Mat_C 完全相同。")
+    else:
+        print("\n❌ 结论：结果不一致。")
+        print("脚本计算出的 Mat_C 与日志文件中记录的 Mat_C 不同。")
+        c_log_skipped_inf = np.where(np.isinf(mat_c_from_log), 0, mat_c_from_log)
+        c_calu_skipped_inf = np.where(np.isinf(calculated_mat_c), 0, calculated_mat_c)
+        difference = np.mean(np.abs(c_calu_skipped_inf - c_log_skipped_inf))
+        print(f"平均差值: {difference}")
+    # 检查mat_c_from_log与calculated_mat_c在相同索引下inf不一致的情况
+        log_inf = np.isinf(mat_c_from_log)
+        calu_inf = np.isinf(calculated_mat_c)
+        mismatch = np.where(log_inf != calu_inf)
+        if mismatch[0].size > 0:
+            for idx in zip(*mismatch):
+                print(f"inf index: {idx}, mat_c_from_log value: {mat_c_from_log[idx]}, calculated_mat_c value: {calculated_mat_c[idx]}")
+                break
 
 if __name__ == '__main__':
     main()
