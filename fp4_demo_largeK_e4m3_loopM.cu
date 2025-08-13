@@ -11,9 +11,11 @@
 #include <fstream>
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 // TensorCore05 使用 MXF4NVF4 (4-bit Float) 格式示例
-#define M 128
+#define M 2048
 #define N 32
-#define K 512
+#define K 256
+#define M_1 128
+#define K_1 64
 #define BLOCKSCALE_NX 4   //scale_vec::4X //指令内部分手动设置
 
 union SmemDescriptor
@@ -73,12 +75,12 @@ union InstrDescriptorBlockScaled
 
 __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, uint8_t *mat_sfb, float *mat_c) {
   int tid     = blockIdx.x * blockDim.x + threadIdx.x;
-  __shared__ uint8_t  mat_a_share[M * 32];
-  __shared__ uint8_t  mat_b_share[N * 32];
-  __shared__ uint8_t  sfa_share[M*16];
-  __shared__ uint8_t  sfb_share[M*16];
-  for (int i = 0; i < M * 16; ++i) sfa_share[i] = 0;
-  for (int i = 0; i < N * 16; ++i) sfb_share[i] = 0;
+  __shared__ uint8_t  mat_a_share[M_1 * 32];
+  __shared__ uint8_t  mat_b_share[32 * 32];
+  __shared__ uint8_t  sfa_share[M_1*16];
+  __shared__ uint8_t  sfb_share[M_1*16];
+  for (int i = 0; i < M_1 * 16; ++i) sfa_share[i] = 0;
+  for (int i = 0; i < 32 * 16; ++i) sfb_share[i] = 0;
   __syncthreads();
 
   __shared__ uint32_t s_tmem_ptr[1];
@@ -120,156 +122,143 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
   mat_sfb_desc.layout_type_    = 0;
   __syncthreads();
 
+  for(int m_loop = 0; m_loop < M; m_loop += 128) {
 
-  for(int k_loop = 0; k_loop < K; k_loop += 64) {
-    if(tid==0){
-      for (int i = 0; i < M; i++){
-        for (int j = 0; j < 32; j++){
-          if ((i/4)%2==0){
-            mat_a_share[i*32 +j] = mat_a[i*K/2 +j + k_loop / 2];
-          }else{
-            int j_ = (j+16)%32;
-            mat_a_share[i*32 +j] = mat_a[i*K/2 +j_ + k_loop / 2];
+    for(int k_loop = 0; k_loop < K; k_loop += 64) {
+      if(tid==0){
+        for (int i = 0; i < M_1; i++){
+          for (int j = 0; j < 32; j++){
+            if ((i/4)%2==0){
+              mat_a_share[i*32 +j] = mat_a[(i+m_loop)*K/2 +j + k_loop / 2];
+            }else{
+              int j_ = (j+16)%32;
+              mat_a_share[i*32 +j] = mat_a[(i+m_loop)*K/2 +j_ + k_loop / 2];
+            }
           }
-        }
-        }
-
-      for (int i = 0; i < N; i++){
-        for (int j = 0; j < 32; j++){
-          if ((i/4)%2==0){
-            mat_b_share[i*32 +j] = mat_b[i*K/2 +j + k_loop / 2];
-          }else{
-            int j_ = (j+16)%32;
-            mat_b_share[i*32 +j] = mat_b[i*K/2 +j_ + k_loop / 2];
           }
-        }
-        }
 
-      for (int i = 0; i < M; i++){
-        for (int j = 0; j < BLOCKSCALE_NX; j++){
-          sfa_share[(i)*16 + j + (i/32)*4] = mat_sfa[i*MAX(16,(K/16)) + (k_loop/16) + j];
-        }
-        }
+        for (int i = 0; i < N; i++){
+          for (int j = 0; j < 32; j++){
+            if ((i/4)%2==0){
+              mat_b_share[i*32 +j] = mat_b[i*K/2 +j + k_loop / 2];
+            }else{
+              int j_ = (j+16)%32;
+              mat_b_share[i*32 +j] = mat_b[i*K/2 +j_ + k_loop / 2];
+            }
+          }
+          }
 
-      for (int i = 0; i < M; i+=N){
-        for (int j = 0; j < N; j++){
-          for (int k = 0; k < BLOCKSCALE_NX; k++){
-            sfb_share[(i+j)*16 + k] = mat_sfb[j*MAX(16,(K/16)) + (k_loop/16) + k];
+        for (int i = 0; i < M_1; i++){
+          for (int j = 0; j < BLOCKSCALE_NX; j++){
+            sfa_share[(i)*16 + j + (i/32)*4] = mat_sfa[(i+m_loop)*MAX(16,(K/16)) + (k_loop/16) + j];
+          }
+          }
+
+        for (int i = 0; i < M_1; i+=N){
+          for (int j = 0; j < N; j++){
+            for (int k = 0; k < BLOCKSCALE_NX; k++){
+              sfb_share[(i+j)*16 + k] = mat_sfb[j*MAX(16,(K/16)) + (k_loop/16) + k];
+            }
           }
         }
       }
+      __syncthreads();
+      asm volatile ("tcgen05.cp.cta_group::1.128x128b [%0], %1;"
+      :
+      : "r"(s_tmem_scaleA_ptr[0]),"l"(uint64_t(mat_sfa_desc)));
+
+      asm volatile ("tcgen05.cp.cta_group::1.128x128b [%0], %1;"
+      :
+      : "r"(s_tmem_scaleB_ptr[0]),"l"(uint64_t(mat_sfb_desc)));
+      asm volatile ("tcgen05.fence::before_thread_sync;");
+      __syncthreads();
+
+      //构建 shared memory descriptor
+      SmemDescriptor mat_a_desc{};
+      mat_a_desc.start_address_ = ((unsigned)__cvta_generic_to_shared(&mat_a_share[0])) >> 4;
+      mat_a_desc.leading_byte_offset_ = 16>>4;    //当前线程两个128bit之间地址差
+      mat_a_desc.stride_byte_offset_ = 256>>4;    //0号和8号 首地址地址差
+
+      mat_a_desc.fixed_001_      = 0xb001;
+      mat_a_desc.base_offset_    = 0;
+      mat_a_desc.fixed_b0_       = 0xb0;
+      mat_a_desc.fixed_b00000000_= 0;
+      mat_a_desc.layout_type_    = 6;             //
+
+
+      // B 矩阵 构建 shared memory descriptor K-major 
+      SmemDescriptor mat_b_desc{};
+      mat_b_desc.start_address_ = ((unsigned)__cvta_generic_to_shared(&mat_b_share[0])) >> 4;
+      mat_b_desc.leading_byte_offset_ = 16>>4;
+      mat_b_desc.stride_byte_offset_ = 256>>4;
+
+      mat_b_desc.fixed_001_      = 0xb001;
+      mat_b_desc.base_offset_    = 0;
+      mat_b_desc.fixed_b0_       = 0xb0;
+      mat_b_desc.fixed_b00000000_= 0;
+      mat_b_desc.layout_type_    = 6;
+
+      //构建 Instr Descriptor
+      InstrDescriptorBlockScaled desc = {};
+      desc.desc_ = 0;
+      desc.m_dim_ = 128>>7;
+      desc.n_dim_ = 32>>3;
+      desc.sparse_flag_=0;
+      desc.sparse_id2_=0;
+      desc.a_format_ = 1;
+      desc.b_format_ = 1;
+      desc.scale_format_ = 0;
+      desc.a_major_ = 0;
+      desc.b_major_ = 0;
+      desc.a_negate_ = 0;
+      desc.b_negate_ = 0;
+
+      desc.a_sf_id_ = (s_tmem_scaleA_ptr[0] & 0xC0000000) >> 30;
+      desc.b_sf_id_ = (s_tmem_scaleB_ptr[0] & 0xC0000000) >> 30;
+      // 最终构造为 64bit 指令描述符（位于高32位）
+      uint64_t idesc = (uint64_t(uint32_t(desc)) << 32);
+
+
+      // 执行 MMA 指令
+      uint32_t scaleC  = k_loop == 0 ? 0 : 1;
+      asm volatile("tcgen05.fence::after_thread_sync;");
+      if (tid==0) {
+          asm volatile(
+              "{\n\t"
+              ".reg .pred p;\n\t"
+              "setp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X [%0], %1, %2, %3, [%5], [%6], p; \n\t"
+              "}\n"
+              :
+              : "r"(s_tmem_ptr[0]), "l"(uint64_t(mat_a_desc)),
+                "l"(uint64_t(mat_b_desc)), "r"(uint32_t(idesc>>32)),
+                "r"(scaleC),
+                "r"(s_tmem_scaleA_ptr[0]),
+                "r"(s_tmem_scaleB_ptr[0])
+          );
+      }
+      __syncthreads();
+
+      asm volatile("tcgen05.fence::before_thread_sync;");
+    }
+    // 读取结果回寄存器
+    uint32_t regD[32];
+    asm volatile("tcgen05.ld.sync.aligned.32x32b.x32.b32 { %0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];\n"
+                : "=r"(regD[0]), "=r"(regD[1]), "=r"(regD[2]), "=r"(regD[3]),
+                  "=r"(regD[4]), "=r"(regD[5]), "=r"(regD[6]), "=r"(regD[7]),
+                  "=r"(regD[8]), "=r"(regD[9]), "=r"(regD[10]), "=r"(regD[11]),
+                  "=r"(regD[12]), "=r"(regD[13]), "=r"(regD[14]), "=r"(regD[15]),
+                  "=r"(regD[16]), "=r"(regD[17]), "=r"(regD[18]), "=r"(regD[19]),
+                  "=r"(regD[20]), "=r"(regD[21]), "=r"(regD[22]), "=r"(regD[23]),
+                  "=r"(regD[24]), "=r"(regD[25]), "=r"(regD[26]), "=r"(regD[27]),
+                  "=r"(regD[28]), "=r"(regD[29]), "=r"(regD[30]), "=r"(regD[31])
+                : "r"(s_tmem_ptr[0]));
+    for(int i = 0; i < 32; i++) {
+      mat_c[32 * (tid+m_loop) + i] = ((float*)regD)[i];
     }
     __syncthreads();
-    asm volatile ("tcgen05.cp.cta_group::1.128x128b [%0], %1;"
-    :
-    : "r"(s_tmem_scaleA_ptr[0]),"l"(uint64_t(mat_sfa_desc)));
-
-    asm volatile ("tcgen05.cp.cta_group::1.128x128b [%0], %1;"
-    :
-    : "r"(s_tmem_scaleB_ptr[0]),"l"(uint64_t(mat_sfb_desc)));
-    asm volatile ("tcgen05.fence::before_thread_sync;");
-    __syncthreads();
-
-    //构建 shared memory descriptor
-    SmemDescriptor mat_a_desc{};
-    mat_a_desc.start_address_ = ((unsigned)__cvta_generic_to_shared(&mat_a_share[0])) >> 4;
-    mat_a_desc.leading_byte_offset_ = 16>>4;    //当前线程两个128bit之间地址差
-    mat_a_desc.stride_byte_offset_ = 256>>4;    //0号和8号 首地址地址差
-
-    mat_a_desc.fixed_001_      = 0xb001;
-    mat_a_desc.base_offset_    = 0;
-    mat_a_desc.fixed_b0_       = 0xb0;
-    mat_a_desc.fixed_b00000000_= 0;
-    mat_a_desc.layout_type_    = 6;             //
-
-
-    // B 矩阵 构建 shared memory descriptor K-major 
-    SmemDescriptor mat_b_desc{};
-    mat_b_desc.start_address_ = ((unsigned)__cvta_generic_to_shared(&mat_b_share[0])) >> 4;
-    mat_b_desc.leading_byte_offset_ = 16>>4;
-    mat_b_desc.stride_byte_offset_ = 256>>4;
-
-    mat_b_desc.fixed_001_      = 0xb001;
-    mat_b_desc.base_offset_    = 0;
-    mat_b_desc.fixed_b0_       = 0xb0;
-    mat_b_desc.fixed_b00000000_= 0;
-    mat_b_desc.layout_type_    = 6;
-
-    //构建 Instr Descriptor
-    InstrDescriptorBlockScaled desc = {};
-    desc.desc_ = 0;
-    desc.m_dim_ = 128>>7;
-    desc.n_dim_ = 32>>3;
-    desc.sparse_flag_=0;
-    desc.sparse_id2_=0;
-    desc.a_format_ = 1;
-    desc.b_format_ = 1;
-    desc.scale_format_ = 0;
-    desc.a_major_ = 0;
-    desc.b_major_ = 0;
-    desc.a_negate_ = 0;
-    desc.b_negate_ = 0;
-
-    desc.a_sf_id_ = (s_tmem_scaleA_ptr[0] & 0xC0000000) >> 30;
-    desc.b_sf_id_ = (s_tmem_scaleB_ptr[0] & 0xC0000000) >> 30;
-    // 最终构造为 64bit 指令描述符（位于高32位）
-    uint64_t idesc = (uint64_t(uint32_t(desc)) << 32);
-
-
-    // 执行 MMA 指令
-    uint32_t scaleC  = k_loop == 0 ? 0 : 1;
-    // if (tid%128==0)printf(" run mma fp4   \n");
-
-    int mod = (K == 64) ? 32 : 128;
-    if (tid%mod==0) {
-        asm volatile(
-            "{\n\t"
-            ".reg .pred p;\n\t"
-            "setp.ne.b32 p, %4, 0;\n\t"
-            "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X [%0], %1, %2, %3, [%5], [%6], p; \n\t"
-            "}\n"
-            :
-            : "r"(s_tmem_ptr[0]), "l"(uint64_t(mat_a_desc)),
-              "l"(uint64_t(mat_b_desc)), "r"(uint32_t(idesc>>32)),
-              "r"(scaleC),
-              "r"(s_tmem_scaleA_ptr[0]),
-              "r"(s_tmem_scaleB_ptr[0])
-        );
-    }
-    __syncthreads();
-
-    asm volatile("tcgen05.fence::before_thread_sync;");
+    
   }
-
-  // 读取结果回寄存器
-  uint32_t regD[32];
-  asm volatile("tcgen05.ld.sync.aligned.32x32b.x32.b32 { %0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];\n"
-               : "=r"(regD[0]), "=r"(regD[1]), "=r"(regD[2]), "=r"(regD[3]),
-                 "=r"(regD[4]), "=r"(regD[5]), "=r"(regD[6]), "=r"(regD[7]),
-                 "=r"(regD[8]), "=r"(regD[9]), "=r"(regD[10]), "=r"(regD[11]),
-                 "=r"(regD[12]), "=r"(regD[13]), "=r"(regD[14]), "=r"(regD[15]),
-                 "=r"(regD[16]), "=r"(regD[17]), "=r"(regD[18]), "=r"(regD[19]),
-                 "=r"(regD[20]), "=r"(regD[21]), "=r"(regD[22]), "=r"(regD[23]),
-                 "=r"(regD[24]), "=r"(regD[25]), "=r"(regD[26]), "=r"(regD[27]),
-                 "=r"(regD[28]), "=r"(regD[29]), "=r"(regD[30]), "=r"(regD[31])
-               : "r"(s_tmem_ptr[0]));
-  for(int i = 0; i < 32; i++) {
-    mat_c[32 * tid + i] = ((float*)regD)[i];
-  }
-
-  // if (tid < 32) {
-  //     printf("TMEM: %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f  %d\n",
-  //            ((float*)regD)[0], ((float*)regD)[1], ((float*)regD)[2], ((float*)regD)[3],
-  //            ((float*)regD)[4], ((float*)regD)[5], ((float*)regD)[6], ((float*)regD)[7],
-  //            ((float*)regD)[8], ((float*)regD)[9], ((float*)regD)[10], ((float*)regD)[11],
-  //            ((float*)regD)[12], ((float*)regD)[13], ((float*)regD)[14], ((float*)regD)[15],
-  //            ((float*)regD)[0+16], ((float*)regD)[1+16], ((float*)regD)[2+16], ((float*)regD)[3+16],
-  //            ((float*)regD)[4+16], ((float*)regD)[5+16], ((float*)regD)[6+16], ((float*)regD)[7+16],
-  //            ((float*)regD)[8+16], ((float*)regD)[9+16], ((float*)regD)[10+16], ((float*)regD)[11+16],
-  //            ((float*)regD)[12+16], ((float*)regD)[13+16], ((float*)regD)[14+16], ((float*)regD)[15+16], tid); 
-  // // }
-
-  __syncthreads();
 
   if(tid<32){
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32  %0, 32;"
@@ -281,7 +270,6 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
     
   }
 }
-
 
 float e2m1_to_float(uint8_t four_bits) {
   // 提取符号位

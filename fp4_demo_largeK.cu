@@ -218,10 +218,8 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
 
     // 执行 MMA 指令
     uint32_t scaleC  = k_loop == 0 ? 0 : 1;
-    // if (tid%128==0)printf(" run mma fp4   \n");
-
-    int mod = (K == 64) ? 32 : 128;
-    if (tid%mod==0) {
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    if (tid==0) {
         asm volatile(
             "{\n\t"
             ".reg .pred p;\n\t"
