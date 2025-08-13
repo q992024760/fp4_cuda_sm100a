@@ -5,14 +5,15 @@
 #include <cuda_fp16.h>
 #include <cuda/std/type_traits>
 #include "common.h"
-#include <iostream>
 #include <iomanip>
 #include <cstdint>
 #include <cmath>
+#include <fstream>
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 // TensorCore05 使用 MXF4NVF4 (4-bit Float) 格式示例
 #define M 128
 #define N 32
-#define K 256
+#define K 512
 #define BLOCKSCALE_NX 2   //scale_vec::2X //指令内部分手动设置
 
 union SmemDescriptor
@@ -76,10 +77,8 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
   __shared__ uint8_t  mat_b_share[N * 32];
   __shared__ uint8_t  sfa_share[M*16];
   __shared__ uint8_t  sfb_share[M*16];
-  // for (int i = 0; i < M * 16; ++i) sfa_share[i] = mat_sfa[i];
-  // for (int i = 0; i < N * 16; ++i) sfb_share[i] = mat_sfb[i];
-    
-
+  for (int i = 0; i < M * 16; ++i) sfa_share[i] = 0;
+  for (int i = 0; i < N * 16; ++i) sfb_share[i] = 0;
   __syncthreads();
 
   __shared__ uint32_t s_tmem_ptr[1];
@@ -148,14 +147,14 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
 
       for (int i = 0; i < M; i++){
         for (int j = 0; j < BLOCKSCALE_NX; j++){
-          sfa_share[(i)*16 + j + (i/32)*4] = mat_sfa[i*16 + (k_loop/16) + j];
+          sfa_share[(i)*16 + j + (i/32)*4] = mat_sfa[i*MAX(16,(K/16)) + (k_loop/16) + j];
         }
         }
 
       for (int i = 0; i < M; i+=N){
         for (int j = 0; j < N; j++){
           for (int k = 0; k < BLOCKSCALE_NX; k++){
-            sfb_share[(i+j)*16 + k] = mat_sfb[j*16 + (k_loop/16) + k];
+            sfb_share[(i+j)*16 + k] = mat_sfb[j*MAX(16,(K/16)) + (k_loop/16) + k];
           }
         }
       }
@@ -221,9 +220,8 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
     uint32_t scaleC  = k_loop == 0 ? 0 : 1;
     // if (tid%128==0)printf(" run mma fp4   \n");
 
-    // if (tid%32==0) {
-    if (tid ==0) {
-
+    int mod = (K == 64) ? 32 : 128;
+    if (tid%mod==0) {
         asm volatile(
             "{\n\t"
             ".reg .pred p;\n\t"
@@ -238,27 +236,10 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
               "r"(s_tmem_scaleB_ptr[0])
         );
     }
+    __syncthreads();
 
     asm volatile("tcgen05.fence::before_thread_sync;");
-
-    __syncthreads();
   }
-
-  // // 读取结果回寄存器
-  // uint32_t regD[16];
-  // asm volatile("tcgen05.ld.sync.aligned.32x32b.x16.b32 { %0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];\n"
-  //              : "=r"(regD[0]), "=r"(regD[1]), "=r"(regD[2]), "=r"(regD[3]),
-  //                "=r"(regD[4]), "=r"(regD[5]), "=r"(regD[6]), "=r"(regD[7]),
-  //                "=r"(regD[8]), "=r"(regD[9]), "=r"(regD[10]), "=r"(regD[11]),
-  //                "=r"(regD[12]), "=r"(regD[13]), "=r"(regD[14]), "=r"(regD[15])
-  //              : "r"(s_tmem_scaleA_ptr[0]));
-
-  // printf("TMEM: 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X %d\n",
-  //        ((uint32_t*)regD)[0], ((uint32_t*)regD)[1], ((uint32_t*)regD)[2], ((uint32_t*)regD)[3],
-  //        ((uint32_t*)regD)[4], ((uint32_t*)regD)[5], ((uint32_t*)regD)[6], ((uint32_t*)regD)[7],
-  //        ((uint32_t*)regD)[8], ((uint32_t*)regD)[9], ((uint32_t*)regD)[10], ((uint32_t*)regD)[11],
-  //        ((uint32_t*)regD)[12], ((uint32_t*)regD)[13], ((uint32_t*)regD)[14], ((uint32_t*)regD)[15], tid); 
-
   // 读取结果回寄存器
   uint32_t regD[32];
   asm volatile("tcgen05.ld.sync.aligned.32x32b.x32.b32 { %0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];\n"
@@ -341,11 +322,24 @@ void print_two_e2m1(uint8_t data) {
   std::cout << std::fixed << std::setprecision(1) << val1 << " " << val2;
 }
 
-int main() {
+template<typename T>
+void save_bin(const std::string &filename, const T* data, size_t count) {
+    std::ofstream ofs(filename, std::ios::binary);
+    ofs.write(reinterpret_cast<const char*>(data), count * sizeof(T));
+    ofs.close();
+}
+
+
+int main(int argc, char** argv) {
     if(K % 64) {
       printf("Error: K is not a multiple of 64\n");
       return 1;
     }
+    int run_id = 0;
+    if (argc > 1) {
+        run_id = std::stoi(argv[1]);
+    }
+    std::ostringstream fname;
 
     std::srand(std::time(nullptr));  // 设置当前时间为种子
 
@@ -362,24 +356,24 @@ int main() {
     cudnnMallocHostInBytes(&host_A, M * K * sizeof(uint8_t) / 2);
     cudnnMallocHostInBytes(&host_B, N * K * sizeof(uint8_t) / 2);
     cudnnMallocHostInBytes(&host_C, M * N * sizeof(float));
-    cudnnMallocHostInBytes(&host_sfa, M * (K/16) * sizeof(uint8_t));
-    cudnnMallocHostInBytes(&host_sfb, N * (K/16) * sizeof(uint8_t));
+    cudnnMallocHostInBytes(&host_sfa, M * MAX(16,(K/16)) * sizeof(uint8_t));
+    cudnnMallocHostInBytes(&host_sfb, N * MAX(16,(K/16)) * sizeof(uint8_t));
 
-    for(int i = 0; i < M * (K/16); i++) ((uint8_t *)host_sfa)[i] = 0;
-    for(int i = 0; i < N * (K/16); i++) ((uint8_t *)host_sfb)[i] = 0;
+    for(int i = 0; i < M * MAX(16,(K/16)); i++) ((uint8_t *)host_sfa)[i] = 0;
+    for(int i = 0; i < N * MAX(16,(K/16)); i++) ((uint8_t *)host_sfb)[i] = 0;
 
     // scale A[M* blockscale]:([128,1]\[128,2]\[128,4])
-    for(int k = 0; k < (K/16); k+=4){ 
+    for(int k = 0; k <(K/16); k+=4){ 
       for (int i = 0; i < M; ++i) {
         for (int j = 0; j < BLOCKSCALE_NX; j++) {
-          ((uint8_t *)host_sfa)[i*16 + k + j] = (uint8_t)(117+rand()%20);
+          ((uint8_t *)host_sfa)[i*MAX(16,(K/16)) + k + j] = (uint8_t)(117+rand()%20);
           // ((uint8_t *)host_sfa)[i*16 + k + j] = (uint8_t)(127);
         }
       }
       //scale B[N* blockscale]:([8,1]\[8,2]\[8,4]\[16,1]\[16,2]\[16,4]......)
       for (int i = 0; i < N; ++i) {
         for (int j = 0; j < BLOCKSCALE_NX; j++) {
-          ((uint8_t *)host_sfb)[i*16 + k + j] = (uint8_t)(117+rand()%20);
+          ((uint8_t *)host_sfb)[i*MAX(16,(K/16)) + k + j] = (uint8_t)(117+rand()%20);
           // ((uint8_t *)host_sfb)[i*16 + k + j] = (uint8_t)(127);
         }
       }
@@ -426,6 +420,9 @@ int main() {
         std::cout <<"]"<<std::endl;
       }
 
+      fname.str(""); fname << "E8M0_2X_Mat_A_" << run_id << ".bin";
+      save_bin(fname.str(), (uint8_t*)host_A, M * K / 2);
+
         std::cout <<"Mat_B(K-major:32x64):"<<std::endl;
       for (int i = 0; i < N; ++i) {
         std::cout << std::setw(3) <<i<<":[ ";
@@ -445,27 +442,36 @@ int main() {
         std::cout <<"]"<<std::endl;
       }
 
+      fname.str(""); fname << "E8M0_2X_Mat_B_" << run_id << ".bin";
+      save_bin(fname.str(), (uint8_t*)host_B, N * K / 2);
+
         std::cout <<"scale A (scale_vec::"<<BLOCKSCALE_NX<<"X 、e8m0) 0x:"<<std::endl;
       for (int i = 0; i < M; ++i) {
         std::cout << std::setw(3) <<i<<":[ ";
-        for(int k = 0; k < (K/16); k+=4){
+        for(int k = 0; k < MAX(16,(K/16)); k+=4){
           for (int j = 0; j < BLOCKSCALE_NX; j ++) {
-            printf("0x%02X , ", ((uint8_t *)host_sfa)[i * 16 + k + j]);
+            printf("0x%02X , ", ((uint8_t *)host_sfa)[i * MAX(16,(K/16)) + k + j]);
           }
         }
         std::cout <<"]"<<std::endl;
       }
 
+      fname.str(""); fname << "E8M0_2X_Scale_A_" << run_id << ".bin";
+      save_bin(fname.str(), (uint8_t*)host_sfa, M * (K/16));
+
         std::cout <<"scale B (scale_vec::"<<BLOCKSCALE_NX<<"X 、e8m0) 0x:"<<std::endl;
       for (int i = 0; i < N; ++i) {
         std::cout << std::setw(3) <<i<<":[ ";
-        for(int k = 0; k < (K/16); k+=4){
+        for(int k = 0; k < MAX(16,(K/16)); k+=4){
           for (int j = 0; j < BLOCKSCALE_NX; j ++) {
-            printf("0x%02X , ", ((uint8_t *)host_sfb)[i * 16 + k + j]);
+            printf("0x%02X , ", ((uint8_t *)host_sfb)[i * MAX(16,(K/16)) + k + j]);
           }
         }
         std::cout <<"]"<<std::endl;
       }
+
+      fname.str(""); fname << "E8M0_2X_Scale_B_" << run_id << ".bin";
+      save_bin(fname.str(), (uint8_t*)host_sfb, N * (K/16));
 
     }
  
@@ -473,12 +479,12 @@ int main() {
     cudaMalloc(&dev_A, M * K * sizeof(uint8_t) / 2);
     cudaMalloc(&dev_B, N * K * sizeof(uint8_t) / 2);
     cudaMalloc(&dev_C, M * N * sizeof(float));
-    cudaMalloc(&dev_sfa, M * (K/16) * sizeof(uint8_t));
-    cudaMalloc(&dev_sfb, N * (K/16) * sizeof(uint8_t));
+    cudaMalloc(&dev_sfa, M * MAX(16,(K/16)) * sizeof(uint8_t));
+    cudaMalloc(&dev_sfb, N * MAX(16,(K/16)) * sizeof(uint8_t));
     checkCUDAErrors(cudaMemcpy(dev_A, host_A, M * K * sizeof(uint8_t) / 2, cudaMemcpyHostToDevice));
     checkCUDAErrors(cudaMemcpy(dev_B, host_B, N * K * sizeof(uint8_t) / 2, cudaMemcpyHostToDevice));
-    checkCUDAErrors(cudaMemcpy(dev_sfa, host_sfa, M * (K/16) * sizeof(uint8_t), cudaMemcpyHostToDevice));
-    checkCUDAErrors(cudaMemcpy(dev_sfb, host_sfb, N * (K/16) * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    checkCUDAErrors(cudaMemcpy(dev_sfa, host_sfa, M * MAX(16,(K/16)) * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    checkCUDAErrors(cudaMemcpy(dev_sfb, host_sfb, N * MAX(16,(K/16)) * sizeof(uint8_t), cudaMemcpyHostToDevice));
     auto status = cudaLaunchKernelEx(&config, mma_on_tmem,
                                      (uint8_t *)dev_A,
                                      (uint8_t *)dev_B,
@@ -497,6 +503,9 @@ int main() {
       }
       printf("\n");
     }
+
+    fname.str(""); fname << "E8M0_2X_Mat_C_" << run_id << ".bin";
+    save_bin(fname.str(), (float*)host_C, M * N);
 
 
     cudaFree(dev_A);
