@@ -5,15 +5,15 @@
 #include <cuda_fp16.h>
 #include <cuda/std/type_traits>
 #include "common.h"
-#include <iostream>
 #include <iomanip>
 #include <cstdint>
 #include <cmath>
+#include <fstream>
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 // TensorCore05 使用 MXF4NVF4 (4-bit Float) 格式示例
 #define M 128
 #define N 32
-#define K 256
+#define K 64
 #define SCALE_FORMAT 0  // 0: E4M3  1: E8M0
 #if SCALE_FORMAT == 1
 #define BLOCKSCALE_NX 2   //scale_vec::2X
@@ -82,10 +82,8 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
   __shared__ uint8_t  mat_b_share[N * 32];
   __shared__ uint8_t  sfa_share[M*16];
   __shared__ uint8_t  sfb_share[M*16];
-  // for (int i = 0; i < M * 16; ++i) sfa_share[i] = mat_sfa[i];
-  // for (int i = 0; i < N * 16; ++i) sfb_share[i] = mat_sfb[i];
-    
-
+  for (int i = 0; i < M * 16; ++i) sfa_share[i] = 0;
+  for (int i = 0; i < N * 16; ++i) sfb_share[i] = 0;
   __syncthreads();
 
   __shared__ uint32_t s_tmem_ptr[1];
@@ -156,6 +154,7 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
         for (int j = 0; j < BLOCKSCALE_NX; j++){
           sfa_share[(i)*16 + j + (i/32)*4] = mat_sfa[i*MAX(16,(K/16)) + (k_loop/16) + j];
         }
+        }
       }
 
       for (int i = 0; i < M; i+=N){
@@ -225,12 +224,8 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
 
     // 执行 MMA 指令
     uint32_t scaleC  = k_loop == 0 ? 0 : 1;
-    // if (tid%128==0)printf(" run mma fp4   \n");
-
-    // if (tid%32==0) {
-
-    asm volatile ("tcgen05.fence::after_thread_sync;");
-    if (tid ==0) {
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    if (tid==0) {
 
 #if SCALE_FORMAT == 0   // E4M3
         asm volatile(
@@ -264,9 +259,9 @@ __global__ void mma_on_tmem(uint8_t *mat_a, uint8_t *mat_b, uint8_t *mat_sfa, ui
 #endif
     }
 
-    asm volatile("tcgen05.fence::before_thread_sync;");
-
     __syncthreads();
+
+    asm volatile("tcgen05.fence::before_thread_sync;");
   }
 
   // 读取结果回寄存器
@@ -339,11 +334,24 @@ void print_two_e2m1(uint8_t data) {
   std::cout << std::fixed << std::setprecision(1) << val1 << " " << val2;
 }
 
-int main() {
+template<typename T>
+void save_bin(const std::string &filename, const T* data, size_t count) {
+    std::ofstream ofs(filename, std::ios::binary);
+    ofs.write(reinterpret_cast<const char*>(data), count * sizeof(T));
+    ofs.close();
+}
+
+int main(int argc, char** argv) {
     if(K % 64) {
       printf("Error: K is not a multiple of 64\n");
       return 1;
     }
+
+    int run_id = 0;
+    if (argc > 1) {
+        run_id = std::stoi(argv[1]);
+    }
+    std::ostringstream fname;
 
     std::srand(std::time(nullptr));  // 设置当前时间为种子
 
@@ -385,9 +393,8 @@ int main() {
       }
     }
 #elif SCALE_FORMAT == 1   // E8M0
-
     // scale A[M* blockscale]:([128,1]\[128,2]\[128,4])
-    for(int k = 0; k < (K/16); k+=4){ 
+    for(int k = 0; k <(K/16); k+=4){ 
       for (int i = 0; i < M; ++i) {
         for (int j = 0; j < BLOCKSCALE_NX; j++) {
           ((uint8_t *)host_sfa)[i*MAX(16,(K/16)) + k + j] = (uint8_t)(117+rand()%20);
@@ -449,6 +456,9 @@ int main() {
         std::cout <<"]"<<std::endl;
       }
 
+      // fname.str(""); fname << "E4M3_2X_Mat_A_" << run_id << ".bin";
+      // save_bin(fname.str(), (uint8_t*)host_A, M * K / 2);
+
         std::cout <<"Mat_B(K-major:32x64):"<<std::endl;
       for (int i = 0; i < N; ++i) {
         std::cout << std::setw(3) <<i<<":[ ";
@@ -468,6 +478,9 @@ int main() {
         std::cout <<"]"<<std::endl;
       }
 
+      // fname.str(""); fname << "E4M3_2X_Mat_B_" << run_id << ".bin";
+      // save_bin(fname.str(), (uint8_t*)host_B, N * K / 2);
+
         std::cout <<"scale A (scale_vec::"<<BLOCKSCALE_NX<<"X 、e8m0) 0x:"<<std::endl;
       for (int i = 0; i < M; ++i) {
         std::cout << std::setw(3) <<i<<":[ ";
@@ -479,6 +492,9 @@ int main() {
         std::cout <<"]"<<std::endl;
       }
 
+      // fname.str(""); fname << "E4M3_2X_Scale_A_" << run_id << ".bin";
+      // save_bin(fname.str(), (uint8_t*)host_sfa, M * (K/16));
+
         std::cout <<"scale B (scale_vec::"<<BLOCKSCALE_NX<<"X 、e8m0) 0x:"<<std::endl;
       for (int i = 0; i < N; ++i) {
         std::cout << std::setw(3) <<i<<":[ ";
@@ -489,6 +505,9 @@ int main() {
         }
         std::cout <<"]"<<std::endl;
       }
+
+      // fname.str(""); fname << "E4M3_2X_Scale_B_" << run_id << ".bin";
+      // save_bin(fname.str(), (uint8_t*)host_sfb, N * (K/16));
 
     }
  
@@ -521,6 +540,8 @@ int main() {
       printf("\n");
     }
 
+    fname.str(""); fname << "E8M0_2X_Mat_C_" << run_id << ".bin";
+    save_bin(fname.str(), (float*)host_C, M * N);
 
     cudaFree(dev_A);
     cudaFree(dev_B);
